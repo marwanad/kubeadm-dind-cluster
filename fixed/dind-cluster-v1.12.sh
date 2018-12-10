@@ -486,6 +486,10 @@ done
 DIND_IMAGE="${DIND_IMAGE:-}"
 BUILD_KUBEADM="${BUILD_KUBEADM:-}"
 BUILD_HYPERKUBE="${BUILD_HYPERKUBE:-}"
+if [[ ! -z ${DIND_K8S_BIN_DIR:-} ]]; then
+  BUILD_KUBEADM=""
+  BUILD_HYPERKUBE=""
+fi
 KUBEADM_SOURCE="${KUBEADM_SOURCE-}"
 HYPERKUBE_SOURCE="${HYPERKUBE_SOURCE-}"
 NUM_NODES=${NUM_NODES:-2}
@@ -518,6 +522,19 @@ if [[ ! ${LOCAL_KUBECTL_VERSION:-} && ${DIND_IMAGE:-} =~ :(v[0-9]+\.[0-9]+)$ ]];
 fi
 
 ENABLE_CEPH="${ENABLE_CEPH:-}"
+
+DIND_CRI="${DIND_CRI:-docker}"
+case "${DIND_CRI}" in
+  docker)
+    CRI_SOCKET=/var/run/dockershim.sock
+    ;;
+  containerd)
+    CRI_SOCKET=/var/run/containerd/containerd.sock
+    ;;
+  *)
+    echo >&2 "Bad DIND_CRI. Please specify 'docker' or 'containerd'"
+    ;;
+esac
 
 # TODO: Test multi-cluster for IPv6, before enabling
 if [[ "${DIND_LABEL}" != "${DEFAULT_DIND_LABEL}"  && "${IP_MODE}" == 'dual-stack' ]]; then
@@ -563,7 +580,7 @@ function dind::retry {
 }
 
 busybox_image="busybox:1.26.2"
-e2e_base_image="golang:1.9.2"
+e2e_base_image="golang:1.10.5"
 sys_volume_args=()
 build_volume_args=()
 
@@ -960,6 +977,7 @@ function dind::run {
   local -a args=("systemd.setenv=CNI_PLUGIN=${CNI_PLUGIN}")
   args+=("systemd.setenv=IP_MODE=${IP_MODE}")
   args+=("systemd.setenv=DIND_STORAGE_DRIVER=${DIND_STORAGE_DRIVER}")
+  args+=("systemd.setenv=DIND_CRI=${DIND_CRI}")
 
   if [[ ${IP_MODE} != "ipv4" ]]; then
     opts+=(--sysctl net.ipv6.conf.all.disable_ipv6=0)
@@ -1019,6 +1037,9 @@ function dind::run {
 
   dind::step "Starting DIND container:" "${container_name}"
 
+  if [[ ! -z ${DIND_K8S_BIN_DIR:-} ]]; then
+      opts+=(-v ${DIND_K8S_BIN_DIR}:/k8s)
+  fi
   if [[ ! ${using_linuxkit} ]]; then
     opts+=(-v /boot:/boot -v /lib/modules:/lib/modules)
   fi
@@ -1061,8 +1082,9 @@ function dind::kubeadm {
   status=0
   # See image/bare/wrapkubeadm.
   # Capturing output is necessary to grab flags for 'kubeadm join'
-  kubelet_feature_gates="-e KUBELET_FEATURE_GATES=${KUBELET_FEATURE_GATES}"
-  if ! docker exec ${kubelet_feature_gates} "${container_id}" /usr/local/bin/wrapkubeadm "$@" 2>&1 | tee >(cat 1>&2); then
+  local -a env=(-e KUBELET_FEATURE_GATES="${KUBELET_FEATURE_GATES}"
+                -e DIND_CRI="${DIND_CRI}")
+  if ! docker exec "${env[@]}" "${container_id}" /usr/local/bin/wrapkubeadm "$@" 2>&1 | tee >(cat 1>&2); then
     echo "*** kubeadm failed" >&2
     return 1
   fi
@@ -1311,6 +1333,7 @@ sed -e "s|{{ADV_ADDR}}|${master_ip}|" \
     -e "s|{{SCHEDULER_EXTRA_ARGS}}|${scheduler_extra_args}|" \
     -e "s|{{KUBE_MASTER_NAME}}|${master_name}|" \
     -e "s|{{DNS_SVC_IP}}|${DNS_SVC_IP}|" \
+    -e "s|{{CRI_SOCKET}}|${CRI_SOCKET}|" \
     /etc/kubeadm.conf.${template}.tmpl > /etc/kubeadm.conf
 EOF
   init_args=(--config /etc/kubeadm.conf)
@@ -1353,7 +1376,9 @@ function dind::join {
   shift
   dind::proxy "${container_id}"
   dind::custom-docker-opts "${container_id}"
-  dind::kubeadm "${container_id}" join --ignore-preflight-errors=all "$@" >/dev/null
+  local -a join_opts=(--ignore-preflight-errors=all
+                      --cri-socket="${CRI_SOCKET}")
+  dind::kubeadm "${container_id}" join "${join_opts[@]}" "$@" >/dev/null
 }
 
 function dind::escape-e2e-name {
@@ -1781,10 +1806,6 @@ function dind::up {
     # FIXME: check for taint & retry if it's there
     "${kubectl}" --context "$ctx" taint nodes $(dind::master-name) node-role.kubernetes.io/master- || true
   fi
-  if [[ ${CNI_PLUGIN} = "calico" ]] && dind::kubeadm-version-at-least 1 12; then
-    echo >&2 "WARNING: for Kubernetes 1.12+, CNI_PLUGIN=calico is the same as CNI_PLUGIN=calico-kdd"
-    CNI_PLUGIN=calico-kdd
-  fi
   case "${CNI_PLUGIN}" in
     bridge | ptp)
       dind::create-static-routes
@@ -1795,11 +1816,18 @@ function dind::up {
       dind::retry "${kubectl}" --context "$ctx" apply --validate=false -f "https://github.com/coreos/flannel/blob/master/Documentation/kube-flannel.yml?raw=true"
       ;;
     calico)
-      dind::retry "${kubectl}" --context "$ctx" apply -f https://docs.projectcalico.org/v2.6/getting-started/kubernetes/installation/hosted/kubeadm/1.6/calico.yaml
+      manifest_base=https://docs.projectcalico.org/${CALICO_VERSION:-v3.3}/getting-started/kubernetes/installation
+      dind::retry "${kubectl}" --context "$ctx" apply -f ${manifest_base}/hosted/etcd.yaml
+      if [ "${CALICO_VERSION:-v3.3}" != master ]; then
+	  dind::retry "${kubectl}" --context "$ctx" apply -f ${manifest_base}/rbac.yaml
+      fi
+      dind::retry "${kubectl}" --context "$ctx" apply -f ${manifest_base}/hosted/calico.yaml
+      dind::retry "${kubectl}" --context "$ctx" apply -f ${manifest_base}/hosted/calicoctl.yaml
       ;;
     calico-kdd)
-      dind::retry "${kubectl}" --context "$ctx" apply -f https://docs.projectcalico.org/v3.3/getting-started/kubernetes/installation/hosted/rbac-kdd.yaml
-      dind::retry "${kubectl}" --context "$ctx" apply -f https://docs.projectcalico.org/v3.3/getting-started/kubernetes/installation/hosted/kubernetes-datastore/calico-networking/1.7/calico.yaml
+      manifest_base=https://docs.projectcalico.org/${CALICO_VERSION:-v3.3}/getting-started/kubernetes/installation
+      dind::retry "${kubectl}" --context "$ctx" apply -f ${manifest_base}/hosted/rbac-kdd.yaml
+      dind::retry "${kubectl}" --context "$ctx" apply -f ${manifest_base}/hosted/kubernetes-datastore/calico-networking/1.7/calico.yaml
       ;;
     weave)
       dind::retry "${kubectl}" --context "$ctx" apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(${kubectl} --context "$ctx" version | base64 | tr -d '\n')"
@@ -1854,7 +1882,11 @@ function dind::fix-mounts {
 
 function dind::snapshot_container {
   local container_name="$1"
-  docker exec -i ${container_name} /usr/local/bin/snapshot prepare
+  # we must pass DIND_CRI here because in case of containerd
+  # a special care must be taken to stop the containers during
+  # the snapshot
+  docker exec -e DIND_CRI="${DIND_CRI}" -i ${container_name} \
+         /usr/local/bin/snapshot prepare
   # remove the hidden *plnk directories
   docker diff ${container_name} | grep -v plnk | docker exec -i ${container_name} /usr/local/bin/snapshot save
 }
